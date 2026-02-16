@@ -442,6 +442,14 @@ func workerCmd() {
 	model := ""
 	natsURL := ""
 	debug := false
+	systemPromptFile := ""
+	taskMessage := ""
+	workDir := ""
+	promptPersona := ""
+	promptVersion := ""
+	dispatchItem := ""
+	stage := ""
+	tier := ""
 
 	args := os.Args[2:]
 	for i := 0; i < len(args); i++ {
@@ -466,6 +474,46 @@ func workerCmd() {
 				natsURL = args[i+1]
 				i++
 			}
+		case "--system-prompt":
+			if i+1 < len(args) {
+				systemPromptFile = args[i+1]
+				i++
+			}
+		case "--task-message":
+			if i+1 < len(args) {
+				taskMessage = args[i+1]
+				i++
+			}
+		case "--workdir":
+			if i+1 < len(args) {
+				workDir = args[i+1]
+				i++
+			}
+		case "--prompt-persona":
+			if i+1 < len(args) {
+				promptPersona = args[i+1]
+				i++
+			}
+		case "--prompt-version":
+			if i+1 < len(args) {
+				promptVersion = args[i+1]
+				i++
+			}
+		case "--dispatch-item":
+			if i+1 < len(args) {
+				dispatchItem = args[i+1]
+				i++
+			}
+		case "--stage":
+			if i+1 < len(args) {
+				stage = args[i+1]
+				i++
+			}
+		case "--tier":
+			if i+1 < len(args) {
+				tier = args[i+1]
+				i++
+			}
 		case "--debug", "-d":
 			debug = true
 			logger.SetLevel(logger.DEBUG)
@@ -476,20 +524,51 @@ func workerCmd() {
 		fmt.Println("Error: --task is required")
 		os.Exit(1)
 	}
-	if missionDir == "" {
-		fmt.Println("Error: --mission-dir is required")
+
+	// --mission-dir is optional when --system-prompt and --task-message are provided
+	useDirectPrompt := systemPromptFile != "" && taskMessage != ""
+	if missionDir == "" && !useDirectPrompt {
+		fmt.Println("Error: --mission-dir is required (unless --system-prompt and --task-message are both provided)")
 		os.Exit(1)
 	}
 
-	// Read briefing
-	briefing, err := mission.ReadBriefing(missionDir, taskID)
-	if err != nil {
-		fmt.Printf("Error reading briefing: %v\n", err)
-		os.Exit(1)
+	// Build system prompt and task message
+	var systemPrompt string
+	var briefing *mission.Briefing
+
+	if useDirectPrompt {
+		// Direct prompt mode: read system prompt from file
+		promptBytes, err := os.ReadFile(systemPromptFile)
+		if err != nil {
+			fmt.Printf("Error reading system prompt file: %v\n", err)
+			os.Exit(1)
+		}
+		systemPrompt = string(promptBytes)
+		// taskMessage already set from flag
+	} else {
+		// Legacy briefing mode
+		var err error
+		briefing, err = mission.ReadBriefing(missionDir, taskID)
+		if err != nil {
+			fmt.Printf("Error reading briefing: %v\n", err)
+			os.Exit(1)
+		}
+		systemPrompt = mission.BuildWorkerPrompt(briefing)
+		taskMessage = mission.BuildTaskMessage(briefing)
+	}
+
+	// Resolve effective working directory
+	effectiveWorkDir := workDir
+	if effectiveWorkDir == "" {
+		effectiveWorkDir = missionDir
 	}
 
 	if debug {
-		fmt.Printf("[worker] Task: %s\n[worker] Objective: %s\n", briefing.TaskID, briefing.Objective)
+		if briefing != nil {
+			fmt.Printf("[worker] Task: %s\n[worker] Objective: %s\n", briefing.TaskID, briefing.Objective)
+		} else {
+			fmt.Printf("[worker] Task: %s\n[worker] Direct prompt mode (system-prompt: %s)\n", taskID, systemPromptFile)
+		}
 	}
 
 	// Load config
@@ -511,13 +590,9 @@ func workerCmd() {
 		os.Exit(1)
 	}
 
-	// Create restricted tool registry (fs + shell only, restricted to mission dir)
+	// Create restricted tool registry (fs + shell only, restricted to working dir)
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
-
-	// Build worker system prompt and task message
-	systemPrompt := mission.BuildWorkerPrompt(briefing)
-	taskMessage := mission.BuildTaskMessage(briefing)
 
 	// Execute worker task
 	startTime := time.Now()
@@ -536,8 +611,10 @@ func workerCmd() {
 		findings.Issues = []string{taskErr.Error()}
 	}
 
-	if writeErr := mission.WriteFindings(missionDir, findings); writeErr != nil {
-		fmt.Printf("Warning: failed to write findings: %v\n", writeErr)
+	if missionDir != "" {
+		if writeErr := mission.WriteFindings(missionDir, findings); writeErr != nil {
+			fmt.Printf("Warning: failed to write findings: %v\n", writeErr)
+		}
 	}
 
 	// Publish NATS event if URL provided
@@ -551,16 +628,34 @@ func workerCmd() {
 		} else {
 			defer hermesClient.Close()
 
+			metadata := make(map[string]string)
+			if promptPersona != "" {
+				metadata["prompt_persona"] = promptPersona
+			}
+			if promptVersion != "" {
+				metadata["prompt_version"] = promptVersion
+			}
+			if dispatchItem != "" {
+				metadata["dispatch_item"] = dispatchItem
+			}
+			if stage != "" {
+				metadata["stage"] = stage
+			}
+			if tier != "" {
+				metadata["tier"] = tier
+			}
+
 			sessionData := &hermes.SessionData{
 				SessionID:    fmt.Sprintf("picoclaw-%s", taskID),
 				TaskID:       taskID,
 				AgentType:    "picoclaw",
 				FilesChanged: filesChanged,
 				DurationMs:   duration.Milliseconds(),
-				WorkingDir:   missionDir,
+				WorkingDir:   effectiveWorkDir,
 				Timestamp:    time.Now().UTC().Format(time.RFC3339),
 				Model:        cfg.Agents.Defaults.Model,
 				Runtime:      fmt.Sprintf("picoclaw-%s", version),
+				Metadata:     metadata,
 			}
 			if usage != nil {
 				sessionData.InputTokens = int64(usage.PromptTokens)
