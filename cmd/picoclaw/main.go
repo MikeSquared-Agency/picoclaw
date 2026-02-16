@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"log/slog"
+
 	"github.com/sipeed/picoclaw/pkg/agent"
 	"github.com/sipeed/picoclaw/pkg/auth"
 	"github.com/sipeed/picoclaw/pkg/bus"
@@ -29,8 +31,10 @@ import (
 	"github.com/sipeed/picoclaw/pkg/cron"
 	"github.com/sipeed/picoclaw/pkg/devices"
 	"github.com/sipeed/picoclaw/pkg/heartbeat"
+	"github.com/sipeed/picoclaw/pkg/hermes"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/migrate"
+	"github.com/sipeed/picoclaw/pkg/mission"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/skills"
 	"github.com/sipeed/picoclaw/pkg/state"
@@ -130,6 +134,8 @@ func main() {
 		onboard()
 	case "agent":
 		agentCmd()
+	case "worker":
+		workerCmd()
 	case "gateway":
 		gatewayCmd()
 	case "status":
@@ -205,6 +211,7 @@ func printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  onboard     Initialize picoclaw configuration and workspace")
 	fmt.Println("  agent       Interact with the agent directly")
+	fmt.Println("  worker      Execute a worker task from a mission briefing")
 	fmt.Println("  auth        Manage authentication (login, logout, status)")
 	fmt.Println("  gateway     Start picoclaw gateway")
 	fmt.Println("  status      Show picoclaw status")
@@ -426,6 +433,166 @@ func agentCmd() {
 	} else {
 		fmt.Printf("%s Interactive mode (Ctrl+C to exit)\n\n", logo)
 		interactiveMode(agentLoop, sessionKey)
+	}
+}
+
+func workerCmd() {
+	taskID := ""
+	missionDir := ""
+	model := ""
+	natsURL := ""
+	debug := false
+
+	args := os.Args[2:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--task":
+			if i+1 < len(args) {
+				taskID = args[i+1]
+				i++
+			}
+		case "--mission-dir":
+			if i+1 < len(args) {
+				missionDir = args[i+1]
+				i++
+			}
+		case "--model":
+			if i+1 < len(args) {
+				model = args[i+1]
+				i++
+			}
+		case "--nats-url":
+			if i+1 < len(args) {
+				natsURL = args[i+1]
+				i++
+			}
+		case "--debug", "-d":
+			debug = true
+			logger.SetLevel(logger.DEBUG)
+		}
+	}
+
+	if taskID == "" {
+		fmt.Println("Error: --task is required")
+		os.Exit(1)
+	}
+	if missionDir == "" {
+		fmt.Println("Error: --mission-dir is required")
+		os.Exit(1)
+	}
+
+	// Read briefing
+	briefing, err := mission.ReadBriefing(missionDir, taskID)
+	if err != nil {
+		fmt.Printf("Error reading briefing: %v\n", err)
+		os.Exit(1)
+	}
+
+	if debug {
+		fmt.Printf("[worker] Task: %s\n[worker] Objective: %s\n", briefing.TaskID, briefing.Objective)
+	}
+
+	// Load config
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Printf("Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Model override: flag > config default
+	if model != "" {
+		cfg.Agents.Defaults.Model = model
+	}
+
+	// Create provider
+	provider, err := providers.CreateProvider(cfg)
+	if err != nil {
+		fmt.Printf("Error creating provider: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Create restricted tool registry (fs + shell only, restricted to mission dir)
+	msgBus := bus.NewMessageBus()
+	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+
+	// Build worker system prompt and task message
+	systemPrompt := mission.BuildWorkerPrompt(briefing)
+	taskMessage := mission.BuildTaskMessage(briefing)
+
+	// Execute worker task
+	startTime := time.Now()
+	ctx := context.Background()
+	responseText, filesChanged, usage, taskErr := agentLoop.ProcessWorkerTask(ctx, systemPrompt, taskMessage)
+	duration := time.Since(startTime)
+
+	// Write findings
+	findings := &mission.Findings{
+		TaskID:       taskID,
+		Summary:      responseText,
+		FilesChanged: filesChanged,
+	}
+	if taskErr != nil {
+		findings.Summary = fmt.Sprintf("Task failed: %v", taskErr)
+		findings.Issues = []string{taskErr.Error()}
+	}
+
+	if writeErr := mission.WriteFindings(missionDir, findings); writeErr != nil {
+		fmt.Printf("Warning: failed to write findings: %v\n", writeErr)
+	}
+
+	// Publish NATS event if URL provided
+	if natsURL != "" {
+		slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		natsToken := os.Getenv("PICOCLAW_NATS_TOKEN")
+
+		hermesClient, hermesErr := hermes.Connect(natsURL, natsToken, slogger)
+		if hermesErr != nil {
+			fmt.Printf("Warning: NATS connection failed: %v\n", hermesErr)
+		} else {
+			defer hermesClient.Close()
+
+			sessionData := &hermes.SessionData{
+				SessionID:    fmt.Sprintf("picoclaw-%s", taskID),
+				TaskID:       taskID,
+				AgentType:    "picoclaw",
+				FilesChanged: filesChanged,
+				DurationMs:   duration.Milliseconds(),
+				WorkingDir:   missionDir,
+				Timestamp:    time.Now().UTC().Format(time.RFC3339),
+				Model:        cfg.Agents.Defaults.Model,
+				Runtime:      fmt.Sprintf("picoclaw-%s", version),
+			}
+			if usage != nil {
+				sessionData.InputTokens = int64(usage.PromptTokens)
+				sessionData.OutputTokens = int64(usage.CompletionTokens)
+				sessionData.CacheRead = int64(usage.CacheReadTokens)
+				sessionData.CacheWrite = int64(usage.CacheWriteTokens)
+			}
+
+			if taskErr != nil {
+				sessionData.ExitCode = 1
+				if pubErr := hermesClient.PublishFailed(sessionData); pubErr != nil {
+					fmt.Printf("Warning: failed to publish NATS event: %v\n", pubErr)
+				}
+			} else {
+				sessionData.ExitCode = 0
+				if pubErr := hermesClient.PublishCompleted(sessionData); pubErr != nil {
+					fmt.Printf("Warning: failed to publish NATS event: %v\n", pubErr)
+				}
+			}
+		}
+	}
+
+	if taskErr != nil {
+		fmt.Printf("Worker task failed: %v\n", taskErr)
+		os.Exit(1)
+	}
+
+	if debug {
+		fmt.Printf("[worker] Completed in %s, %d files changed\n", duration, len(filesChanged))
+		if usage != nil {
+			fmt.Printf("[worker] Tokens: %d in, %d out\n", usage.PromptTokens, usage.CompletionTokens)
+		}
 	}
 }
 
