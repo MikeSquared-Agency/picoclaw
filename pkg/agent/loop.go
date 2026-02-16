@@ -568,6 +568,88 @@ func (al *AgentLoop) runLLMIteration(ctx context.Context, messages []providers.M
 	return finalContent, iteration, nil
 }
 
+// ProcessWorkerTask runs a single worker task without session history or summarization.
+// It returns the final response text, list of files changed, accumulated token usage, and any error.
+func (al *AgentLoop) ProcessWorkerTask(ctx context.Context, systemPrompt, taskMessage string) (string, []string, *providers.UsageInfo, error) {
+	messages := []providers.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: taskMessage},
+	}
+
+	totalUsage := &providers.UsageInfo{}
+	filesChanged := make(map[string]bool)
+	var finalContent string
+
+	for iteration := 0; iteration < al.maxIterations; iteration++ {
+		providerToolDefs := al.tools.ToProviderDefs()
+
+		response, err := al.provider.Chat(ctx, messages, providerToolDefs, al.model, map[string]interface{}{
+			"max_tokens":  8192,
+			"temperature": 0.3, // lower temp for worker precision
+		})
+		if err != nil {
+			return "", nil, totalUsage, fmt.Errorf("LLM call failed: %w", err)
+		}
+
+		if response.Usage != nil {
+			totalUsage.Add(response.Usage)
+		}
+
+		if len(response.ToolCalls) == 0 {
+			finalContent = response.Content
+			break
+		}
+
+		// Build assistant message with tool calls
+		assistantMsg := providers.Message{
+			Role:    "assistant",
+			Content: response.Content,
+		}
+		for _, tc := range response.ToolCalls {
+			argumentsJSON, _ := json.Marshal(tc.Arguments)
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: &providers.FunctionCall{
+					Name:      tc.Name,
+					Arguments: string(argumentsJSON),
+				},
+			})
+		}
+		messages = append(messages, assistantMsg)
+
+		// Execute tool calls
+		for _, tc := range response.ToolCalls {
+			// Track file changes from write/edit tools
+			if tc.Name == "write_file" || tc.Name == "edit_file" || tc.Name == "append_file" {
+				if fp, ok := tc.Arguments["file_path"].(string); ok && fp != "" {
+					filesChanged[fp] = true
+				}
+			}
+
+			toolResult := al.tools.ExecuteWithContext(ctx, tc.Name, tc.Arguments, "worker", "worker", nil)
+
+			contentForLLM := toolResult.ForLLM
+			if contentForLLM == "" && toolResult.Err != nil {
+				contentForLLM = toolResult.Err.Error()
+			}
+
+			messages = append(messages, providers.Message{
+				Role:       "tool",
+				Content:    contentForLLM,
+				ToolCallID: tc.ID,
+			})
+		}
+	}
+
+	files := make([]string, 0, len(filesChanged))
+	for f := range filesChanged {
+		files = append(files, f)
+	}
+
+	return finalContent, files, totalUsage, nil
+}
+
 // updateToolContexts updates the context for tools that need channel/chatID info.
 func (al *AgentLoop) updateToolContexts(channel, chatID string) {
 	// Use ContextualTool interface instead of type assertions
