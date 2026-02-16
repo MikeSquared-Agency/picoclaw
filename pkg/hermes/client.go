@@ -43,8 +43,9 @@ type SessionData struct {
 	Runtime        string   `json:"runtime,omitempty"`
 	InputTokens    int64    `json:"input_tokens,omitempty"`
 	OutputTokens   int64    `json:"output_tokens,omitempty"`
-	CacheRead      int64    `json:"cache_read_tokens,omitempty"`
-	CacheWrite     int64    `json:"cache_write_tokens,omitempty"`
+	CacheRead      int64             `json:"cache_read_tokens,omitempty"`
+	CacheWrite     int64             `json:"cache_write_tokens,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
 }
 
 // Client is a short-lived NATS JetStream publisher for PicoClaw worker events.
